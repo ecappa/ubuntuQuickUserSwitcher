@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Quick Switch
+Comment=Switch between user accounts quickly
+Icon=system-users
+Exec=/home/eric/devRoot/quickSwitch/quick_switch.py
+Categories=System;Utility;
+Keywords=user;switch;account;login;
+StartupNotify=true
