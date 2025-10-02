@@ -153,7 +153,10 @@ class UserSwitcher(Adw.ApplicationWindow):
         if pic_path:
             try:
                 pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(pic_path, 48, 48, True)
-                avatar.set_custom_image(pixbuf)
+                # Convert pixbuf to paintable for GTK4 compatibility
+                from gi.repository import Gdk
+                texture = Gdk.Texture.new_for_pixbuf(pixbuf)
+                avatar.set_custom_image(texture)
             except (GLib.Error, OSError) as e:
                 logger.warning(f"Failed to load profile picture for {username}: {e}")
                 # Use default avatar if image loading fails
