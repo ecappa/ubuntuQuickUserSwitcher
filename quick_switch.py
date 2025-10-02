@@ -5,11 +5,23 @@ import os
 import pwd
 import subprocess
 import sys
+import re
+import shlex
+import logging
 from pathlib import Path
 
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GdkPixbuf, Gio, GLib
+
+# Configuration constants
+ACCOUNTS_SERVICE_ICONS_PATH = '/var/lib/AccountsService/icons'
+DEFAULT_HOME_PREFIX = '/home/'
+USERNAME_MAX_LENGTH = 32
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 class UserSwitcher(Adw.ApplicationWindow):
     def __init__(self, **kwargs):
@@ -58,16 +70,52 @@ class UserSwitcher(Adw.ApplicationWindow):
 
         # Load users
         self.load_users()
+    
+    def validate_username(self, username):
+        """Validate username against POSIX standards"""
+        if not username:
+            return False
+        if len(username) > USERNAME_MAX_LENGTH:
+            return False
+        # POSIX username regex: starts with letter/underscore, followed by letters, digits, underscore, hyphen, or dollar
+        # Also check for control characters and whitespace
+        if not re.match(r'^[a-z_]([a-z0-9_-]{0,31}|[a-z0-9_-]{0,30}\$)$', username) or any(c.isspace() or ord(c) < 32 for c in username):
+            return False
+        return True
+    
+    def validate_home_path(self, home_dir):
+        """Validate that home directory is safe to access"""
+        try:
+            home_path = Path(home_dir).resolve()
+            # Ensure home directory is under /home/ or another safe location
+            if not str(home_path).startswith(DEFAULT_HOME_PREFIX):
+                return False
+            # Ensure it's not a symlink to somewhere dangerous
+            if home_path.is_symlink():
+                # Additional validation could be added here for symlinks
+                pass
+            return True
+        except (OSError, ValueError):
+            return False
 
     def get_profile_picture(self, username, home_dir):
         """Get user profile picture from various locations"""
+        # Validate username and home directory before proceeding
+        if not self.validate_username(username):
+            logger.warning(f"Invalid username format: {username}")
+            return None
+        
+        if not self.validate_home_path(home_dir):
+            logger.warning(f"Unsafe home directory path: {home_dir}")
+            return None
+        
         try:
             # Try AccountsService first (public location)
-            accounts_path = Path(f"/var/lib/AccountsService/icons/{username}")
+            accounts_path = Path(f"{ACCOUNTS_SERVICE_ICONS_PATH}/{username}")
             if accounts_path.exists():
                 return str(accounts_path)
 
-            # Try ~/.face only if accessible
+            # Try ~/.face only if accessible and path is safe
             face_path = Path(home_dir) / ".face"
             if face_path.exists():
                 return str(face_path)
@@ -77,8 +125,9 @@ class UserSwitcher(Adw.ApplicationWindow):
                 face_ext_path = Path(home_dir) / f".face{ext}"
                 if face_ext_path.exists():
                     return str(face_ext_path)
-        except (PermissionError, OSError):
+        except (PermissionError, OSError) as e:
             # Can't access this user's home directory, skip profile picture
+            logger.debug(f"Cannot access profile picture for {username}: {e}")
             pass
 
         return None
@@ -104,10 +153,10 @@ class UserSwitcher(Adw.ApplicationWindow):
         if pic_path:
             try:
                 pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(pic_path, 48, 48, True)
-                texture = Gio.Texture.new_for_pixbuf(pixbuf)
-                avatar.set_custom_image(texture)
-            except Exception:
-                pass  # Use default avatar if image loading fails
+                avatar.set_custom_image(pixbuf)
+            except (GLib.Error, OSError) as e:
+                logger.warning(f"Failed to load profile picture for {username}: {e}")
+                # Use default avatar if image loading fails
 
         row.add_prefix(avatar)
 
@@ -146,6 +195,11 @@ class UserSwitcher(Adw.ApplicationWindow):
             if not shell or shell in ['/usr/sbin/nologin', '/bin/false', '/usr/bin/false']:
                 continue
 
+            # Validate username format for security
+            if not self.validate_username(username):
+                logger.warning(f"Skipping user with invalid username format: {username}")
+                continue
+
             # Extract full name from GECOS field
             fullname = gecos.split(',')[0] if gecos else username
 
@@ -168,6 +222,15 @@ class UserSwitcher(Adw.ApplicationWindow):
             return
 
         username = row.user_data
+        
+        # Additional security validation
+        if not self.validate_username(username):
+            error_dialog = Adw.MessageDialog.new(self)
+            error_dialog.set_heading("Invalid User")
+            error_dialog.set_body(f"Selected user '{username}' has an invalid format.")
+            error_dialog.add_response("ok", "OK")
+            error_dialog.present()
+            return
 
         # Confirm switch
         dialog = Adw.MessageDialog.new(self)
@@ -206,6 +269,15 @@ class UserSwitcher(Adw.ApplicationWindow):
     def on_confirm_switch(self, dialog, response, username):
         """Handle switch confirmation with intelligent session switching"""
         if response == "switch":
+            # Additional security validation
+            if not self.validate_username(username):
+                error_dialog = Adw.MessageDialog.new(self)
+                error_dialog.set_heading("Security Error")
+                error_dialog.set_body("Invalid username format detected.")
+                error_dialog.add_response("ok", "OK")
+                error_dialog.present()
+                return
+            
             # First, get active sessions
             sessions = self.get_user_sessions()
             user_has_session = username in sessions
@@ -215,31 +287,33 @@ class UserSwitcher(Adw.ApplicationWindow):
             if user_has_session:
                 # User has an active session - switch directly
                 session_id = sessions[username]['session_id']
+                # Safely quote username for shell commands
+                safe_username = shlex.quote(username)
                 methods = [
                     # Method 1: Activate existing session (most reliable)
                     (['loginctl', 'activate', session_id], f"Activate existing session {session_id}"),
 
-                    # Method 2: Switch to user with dm-tool
-                    (['dm-tool', 'switch-to-user', username], "LightDM direct switch"),
+                    # Method 2: Switch to user with dm-tool (username is safe, but quote for consistency)
+                    (['dm-tool', 'switch-to-user', safe_username], "LightDM direct switch"),
 
-                    # Method 3: GDM D-Bus for existing session
+                    # Method 3: GDM D-Bus for existing session (username is safe, but quote for consistency)
                     (['dbus-send', '--system', '--type=method_call',
                       '--dest=org.freedesktop.DisplayManager',
                       '/org/freedesktop/DisplayManager/Seat0',
                       'org.freedesktop.DisplayManager.Seat.SwitchToUser',
-                      f'string:{username}', 'string:'], "GDM D-Bus switch"),
+                      f'string:{safe_username}', 'string:'], "GDM D-Bus switch"),
                 ]
 
                 for method, description in methods:
                     try:
-                        print(f"Trying {description} for existing session...")
+                        logger.debug(f"Trying {description} for existing session...")
                         subprocess.run(method, check=True, capture_output=True, timeout=5)
-                        print(f"Success with {description}")
+                        logger.info(f"Success with {description}")
                         success = True
                         self.close()
                         break
                     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
-                        print(f"Failed {description}: {e}")
+                        logger.warning(f"Failed {description}: {e}")
                         continue
 
             if not success:
@@ -254,7 +328,7 @@ class UserSwitcher(Adw.ApplicationWindow):
 
                 for method, description in greeter_methods:
                     try:
-                        print(f"Trying {description}...")
+                        logger.debug(f"Trying {description}...")
                         subprocess.run(method, check=True, capture_output=True, timeout=5)
 
                         # If locking session, also switch to greeter
@@ -269,6 +343,7 @@ class UserSwitcher(Adw.ApplicationWindow):
                         else:
                             info_text = f"Opened login screen for user '{username}'.\nThis user needs to login for the first time."
 
+                        logger.info(f"Successfully opened login screen for user {username}")
                         info_dialog = Adw.MessageDialog.new(self)
                         info_dialog.set_heading("Login Screen Opened")
                         info_dialog.set_body(info_text)
@@ -278,11 +353,12 @@ class UserSwitcher(Adw.ApplicationWindow):
                         self.close()
                         break
                     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
-                        print(f"Failed {description}: {e}")
+                        logger.warning(f"Failed {description}: {e}")
                         continue
 
             # If everything failed
             if not success:
+                logger.error(f"Failed to switch to user '{username}' - all methods exhausted")
                 error_dialog = Adw.MessageDialog.new(self)
                 error_dialog.set_heading("Switch Failed")
                 error_dialog.set_body(f"Unable to switch to user '{username}' or open login screen.\nTry using the system's built-in user switcher.")
